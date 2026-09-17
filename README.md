@@ -14,7 +14,8 @@ YouTuber ごとの「話し方」と「編集者の判断」を学習し、そ�
 
 ## 起動（日常運用はこれだけ）
 ```
-./start.sh        # Mac / Linux
+./start.sh        # Linux
+start.command     # Mac（Finder でダブルクリック）
 start.bat         # Windows
 ```
 初回だけ依存をインストールして画面をビルドし、ブラウザで `http://127.0.0.1:8765/` が開く。
