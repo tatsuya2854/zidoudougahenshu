@@ -1,0 +1,39 @@
+# 単価表（USD）。2026-09 時点の公開価格。変わったらここだけ直す。
+# key: provider → model → unit → 単価（unit 1 あたり）
+# tokens 系は 1 トークンあたり（= 1M あたり価格 / 1,000,000）
+transcription:
+  openai:
+    whisper-1: {minutes: 0.006}
+    gpt-4o-transcribe: {minutes: 0.006}
+    gpt-4o-transcribe-diarize: {minutes: 0.006}
+    gpt-4o-mini-transcribe: {minutes: 0.003}
+  deepgram:
+    nova-3: {minutes: 0.0043}
+  elevenlabs:
+    scribe_v2: {minutes: 0.00367}
+  faster_whisper:
+    "*": {minutes: 0.0}          # ローカル。電気代・GPU代は video_processing の cpu_minutes で概算
+  mock:
+    "*": {minutes: 0.0}
+llm:
+  anthropic:
+    claude-opus-5:   {input_tokens: 5.0e-6,  output_tokens: 25.0e-6, cache_read_tokens: 0.5e-6,  cache_write_tokens: 6.25e-6}
+    claude-sonnet-5: {input_tokens: 2.0e-6,  output_tokens: 10.0e-6, cache_read_tokens: 0.2e-6,  cache_write_tokens: 2.5e-6}
+    claude-haiku-4-5: {input_tokens: 1.0e-6, output_tokens: 5.0e-6,  cache_read_tokens: 0.1e-6,  cache_write_tokens: 1.25e-6}
+  openai:
+    "*": {input_tokens: 2.0e-6, output_tokens: 10.0e-6, cache_read_tokens: 0.5e-6}
+  mock:
+    "*": {input_tokens: 0.0, output_tokens: 0.0}
+vision:
+  yunet:
+    "*": {frames: 0.0}
+  none:
+    "*": {frames: 0.0}
+video_processing:
+  ffmpeg:
+    "*": {cpu_minutes: 0.002}    # ローカル CPU の概算（クラウド c6 相当 1vCPU-min）。自前PCなら 0 でも可
+storage:
+  local:
+    "*": {gb_month: 0.0}
+  s3:
+    "*": {gb_month: 0.023}

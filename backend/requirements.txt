@@ -1,0 +1,14 @@
+anthropic==1.6.0
+openai==3.14.1
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+sqlmodel==0.0.42
+sqlalchemy==2.0.54
+pydantic==2.13.5
+pydantic-settings==2.15.0
+opencv-python-headless==5.0.0.93
+numpy==2.4.6
+python-multipart==0.0.32
+aiofiles==25.1.0
+pyyaml==6.0.3
+httpx==0.28.1

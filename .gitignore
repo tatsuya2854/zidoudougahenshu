@@ -1,0 +1,25 @@
+# secrets
+.env
+*.key
+
+# python
+__pycache__/
+*.pyc
+backend/.venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# node
+frontend/node_modules/
+frontend/dist/
+
+# runtime data (videos, DB, renders)
+data/
+!data/.gitkeep
+*.db
+*.sqlite
+
+# os
+.DS_Store
+Thumbs.db

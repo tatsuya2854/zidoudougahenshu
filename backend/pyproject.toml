@@ -1,0 +1,12 @@
+[project]
+name = "creator-dna-editor"
+version = "0.1.0"
+description = "YouTuber ごとの編集スタイルを学習する専属AI編集者（Phase 1）"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 140
