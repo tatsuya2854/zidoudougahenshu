@@ -6,7 +6,10 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+import cv2
+import numpy as np
 
 from ..base import CropKeyframe, MediaInfo, Usage, VideoProcessingProvider
 
@@ -62,6 +65,27 @@ class FFmpegProcessor(VideoProcessingProvider):
                 break
             out.append((s, e))
         return out
+
+    def sample_frames(self, src: Path, *, start: float, end: float, fps: float = 4.0) -> Iterator[tuple[float, np.ndarray]]:
+        cap = cv2.VideoCapture(str(src))
+        if not cap.isOpened():
+            return
+        try:
+            src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            step = max(1, int(round(src_fps / fps)))
+            cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+            idx = 0
+            while cap.grab():
+                t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if t > end:
+                    break
+                if idx % step == 0:
+                    ok, frame = cap.retrieve()
+                    if ok:
+                        yield t - start, frame
+                idx += 1
+        finally:
+            cap.release()
 
     def render_vertical(self, src, dst, *, start, end, crop_w, crop_h, keyframes, out_w, out_h, ass_path, fonts_dir,
                         style="face_track", progress=None) -> Usage:

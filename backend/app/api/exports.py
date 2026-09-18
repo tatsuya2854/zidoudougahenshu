@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 from ..db import get_session
 from ..models import Candidate, Export, Job, Video
 from ..services.jobs import create_job, submit
-from ..services.pipeline import run_export
+from ..services.pipeline import record_decision, run_export
 
 router = APIRouter(tags=["exports"])
 
@@ -41,6 +41,11 @@ def create_exports(video_id: str, body: ExportIn, s: Session = Depends(get_sessi
     s.commit()
     for e in exports:
         s.refresh(e)
+    # 書き出し＝人間が採用した、という判断を HumanEdit に残す（Phase5 の学習材料）
+    for cid in body.candidate_ids:
+        c = s.get(Candidate, cid)
+        if c and c.decision != "accepted":
+            record_decision(cid, "accepted")
     job = create_job("export", video_id=video_id, creator_id=v.creator_id, payload={"export_ids": [e.id for e in exports], "options": body.options})
     for e in exports:
         e.job_id = job.id

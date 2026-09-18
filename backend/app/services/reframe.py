@@ -10,9 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
-
 from ..providers.base import CropKeyframe, VisionProvider
+from ..providers.registry import get_video_provider
 
 
 @dataclass
@@ -39,38 +38,20 @@ def plan_reframe(video: Path, *, start: float, end: float, src_w: int, src_h: in
     crop_w, crop_h = compute_crop_size(src_w, src_h, out_w, out_h)
     center_x = (src_w - crop_w) // 2
     center_y = (src_h - crop_h) // 2
-    cap = cv2.VideoCapture(str(video))
-    if not cap.isOpened():
-        return ReframeResult(crop_w, crop_h, [CropKeyframe(0.0, center_x, center_y)], 0, 0, "center")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    step = max(1, int(round(fps / sample_fps)))
-    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
     samples: list[tuple[float, float | None, float | None]] = []
     frames = 0
     faces_found = 0
-    idx = 0
-    while True:
-        ok = cap.grab()
-        if not ok:
-            break
-        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        if t > end:
-            break
-        if idx % step == 0:
-            ok, frame = cap.retrieve()
-            if ok:
-                frames += 1
-                faces = vision.detect_faces(frame)
-                if faces:
-                    faces_found += 1
-                    f = faces[0]
-                    samples.append((t - start, f.cx, f.cy))
-                else:
-                    samples.append((t - start, None, None))
-                if progress and end > start:
-                    progress(min(0.99, (t - start) / (end - start)))
-        idx += 1
-    cap.release()
+    for t, frame in get_video_provider().sample_frames(video, start=start, end=end, fps=sample_fps):
+        frames += 1
+        faces = vision.detect_faces(frame)
+        if faces:
+            faces_found += 1
+            f = faces[0]
+            samples.append((t, f.cx, f.cy))
+        else:
+            samples.append((t, None, None))
+        if progress and end > start:
+            progress(min(0.99, t / (end - start)))
     if faces_found == 0:
         return ReframeResult(crop_w, crop_h, [CropKeyframe(0.0, center_x, center_y)], frames, 0, "center")
 

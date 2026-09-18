@@ -8,7 +8,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Iterator, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
@@ -154,6 +154,10 @@ class VideoProcessingProvider(ABC):
 
     @abstractmethod
     def detect_silences(self, audio: Path, *, noise_db: float = -35.0, min_sec: float = 0.5) -> list[tuple[float, float]]: ...
+
+    @abstractmethod
+    def sample_frames(self, src: Path, *, start: float, end: float, fps: float = 4.0) -> Iterator[tuple[float, np.ndarray]]:
+        """[start, end) を fps でサンプリングし (クリップ内秒, BGR フレーム) を順に返す。"""
 
     @abstractmethod
     def render_vertical(

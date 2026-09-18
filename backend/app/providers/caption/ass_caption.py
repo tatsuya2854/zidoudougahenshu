@@ -49,8 +49,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 fx = r"{\fscx80\fscy80\t(0,80,\fscx100\fscy100)}"
             elif st.animation == "fade":
                 fx = r"{\fad(80,80)}"
+            elif st.animation == "typewriter":
+                text = _typewriter(text, e - s)
             lines.append(f"Dialogue: 0,{_ts(s)},{_ts(e)},Default,,0,0,0,,{fx}{text}")
         return header + "\n".join(lines) + "\n"
+
+
+def _typewriter(text: str, duration: float) -> str:
+    """1 文字ずつ順に出す。各文字を透明で始めて \\t で自分の番に不透明へ切り替える。
+
+    \\k 系だと未表示文字の縁取りが先に見えてしまうので \\alpha（全 4 色一括）を使う。
+    表示時間の 7 割で全文字を出し切り、残りは読める時間として残す。_wrap の \\N は素通し。
+    """
+    chars = [c for c in text.replace(r"\N", "\n") if c != "\n"]
+    if not chars:
+        return text
+    reveal_ms = max(0.0, duration * 1000 * 0.7)
+    step = reveal_ms / len(chars)
+    out: list[str] = []
+    i = 0
+    for c in text.replace(r"\N", "\n"):
+        if c == "\n":
+            out.append(r"\N")
+            continue
+        t1 = int(i * step)
+        out.append(f"{{\\alpha&HFF&\\t({t1},{t1 + 1},\\alpha&H00&)}}{c}")
+        i += 1
+    return "".join(out)
 
 
 def _chunk_words(words: list[Word], st: CaptionStyle, clip_start: float, clip_end: float) -> list[tuple[float, float, str]]:

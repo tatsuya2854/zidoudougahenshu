@@ -42,6 +42,9 @@ def test_end_to_end(tmp_path: Path) -> None:
         j = _wait_job(client, r["job"]["id"])
         assert j["status"] == "done", j.get("error")
         exps = client.get(f"/api/videos/{v['id']}/exports").json()
+        # 書き出し = 採用。HumanEdit に記録される（Phase5 の学習材料）
+        cands2 = {c["id"]: c for c in client.get(f"/api/videos/{v['id']}/candidates").json()}
+        assert cands2[cands[2]["id"]]["decision"] == "accepted"
         done = [e for e in exps if e["status"] == "done"]
         assert len(done) == 2, exps
         out = Path(done[0]["path"])
