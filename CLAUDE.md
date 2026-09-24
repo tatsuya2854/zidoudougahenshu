@@ -12,7 +12,7 @@ Phase 1（長尺 → 文字起こし → 候補10本 → 選択 → 9:16 → 字
 - `data/` は git 管理外（動画・DB・書き出し）。`.env` は絶対にコミットしない
 
 ## コマンド
-- テスト: `cd backend && .venv/bin/python -m pytest -q`（mock provider で E2E。約 40 秒）
+- テスト: `cd backend && .venv/bin/python -m pytest -q`（mock provider で E2E ×3 + 単体。約 80〜150 秒）
 - 型チェック: `cd frontend && npx tsc -b --noEmit`
 - 画面ビルド: `cd frontend && npm run build`
 - 起動: `./start.sh`（`OPEN_BROWSER=false backend/.venv/bin/python -m app` でも可）

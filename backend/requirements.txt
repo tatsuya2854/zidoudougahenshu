@@ -12,3 +12,5 @@ python-multipart==0.0.32
 aiofiles==25.1.0
 pyyaml==6.0.3
 httpx==0.28.1
+# ローカル文字起こし（APIキー無しの既定）。CPU でも動く。GPU は requirements-local.txt 参照
+faster-whisper>=1.2.1

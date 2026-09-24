@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, fmtDur, fmtTime, uploadVideo } from './api'
-import type { Candidate, CostSummary, Creator, DictEntry, Export, Job, Status, Video } from './api'
+import type { RefObject } from 'react'
+import { ApiError, api, effective, fmtDur, fmtTime, isEdited, uploadVideo } from './api'
+import type { Candidate, CaptionCue, CostSummary, Creator, CropMode, DictEntry, Export, Job, Status, Video } from './api'
 
 // ──────────────────────────── ジョブのポーリング ────────────────────────────
 function useJob(jobId: string | null, onDone?: (j: Job) => void) {
@@ -186,20 +187,25 @@ function DropZone({ creatorId, onUploaded }: { creatorId: string; onUploaded: (v
 }
 
 // ──────────────────────────── 候補カード ────────────────────────────
-function CandidateCard({ c, selected, onToggle, onPreview, onDecide }: {
+function CandidateCard({ c, selected, editing, onToggle, onPreview, onDecide, onEdit }: {
   c: Candidate
   selected: boolean
+  editing: boolean
   onToggle: () => void
   onPreview: () => void
   onDecide: (d: Candidate['decision']) => void
+  onEdit: () => void
 }) {
   const d = c.data
-  const dur = c.end_sec - c.start_sec
+  const eff = effective(c)
+  const dur = eff.end - eff.start
+  const edited = isEdited(c)
   return (
-    <div className={'cand' + (selected ? ' selected' : '') + (c.decision === 'rejected' ? ' rejected' : '')}>
+    <div className={'cand' + (selected ? ' selected' : '') + (c.decision === 'rejected' ? ' rejected' : '') + (editing ? ' editing' : '')}>
       <div className="thumb">
         <img src={`/api/candidates/${c.id}/thumb`} alt="" onError={(e) => ((e.target as HTMLImageElement).style.visibility = 'hidden')} />
         <button className="small" onClick={onPreview}>▶ プレビュー</button>
+        <button className={'small' + (editing ? ' primary' : '')} onClick={onEdit}>✏️ 編集</button>
         <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text)', cursor: 'pointer' }}>
           <input type="checkbox" style={{ width: 'auto' }} checked={selected} onChange={onToggle} /> 採用する
         </label>
@@ -212,8 +218,9 @@ function CandidateCard({ c, selected, onToggle, onPreview, onDecide }: {
         <div className="head">
           <span className="badge">#{c.rank}</span>
           <span className={'score' + (c.score >= 80 ? ' hi' : '')}>{Math.round(c.score)}</span>
-          <span className="title">{d.title}</span>
-          <span className="badge">{fmtTime(c.start_sec)} → {fmtTime(c.end_sec)}（{dur.toFixed(0)}秒）</span>
+          <span className="title">{eff.title}</span>
+          <span className="badge">{fmtTime(eff.start)} → {fmtTime(eff.end)}（{dur.toFixed(0)}秒）</span>
+          {edited && <span className="badge accent" title={'手直し: ' + Object.keys(c.overrides).join(', ')}>編集済み</span>}
           {d.standalone_ok ? <span className="badge ok">単体OK</span> : <span className="badge warn">要文脈</span>}
           {d.tags?.map((t) => <span key={t} className="tag">#{t}</span>)}
         </div>
@@ -238,6 +245,227 @@ function CandidateCard({ c, selected, onToggle, onPreview, onDecide }: {
 }
 const SCORE_LABEL: Record<string, string> = {
   hook_strength: 'フック', standalone: '単体成立', creator_likeness: 'らしさ', retention: '維持', payoff: 'オチ', past_shorts_similarity: '過去Shorts類似',
+}
+
+// ──────────────────────────── 候補の手直し ────────────────────────────
+// 開始/終了・タイトル・構図・字幕の位置/サイズ・字幕本文を GUI で直す。保存は PUT /overrides（部分更新）。
+// サーバ側で HumanEdit に before/after が残るので、ここでの手直しはそのまま Phase5 の学習データになる。
+const CROP_LABEL: Record<CropMode, string> = { face_track: '話者追従', center: '中央', blur_fit: '全体表示＋ぼかし', manual: '手動（左右を指定）' }
+
+function EditPanel({ c, video, videoRef, onSaved, onClose, onPreview, notify }: {
+  c: Candidate
+  video: Video
+  videoRef: RefObject<HTMLVideoElement | null>
+  onSaved: (c: Candidate) => void
+  onClose: () => void
+  onPreview: (start: number, end: number) => void
+  notify: (msg: string) => void
+}) {
+  const o = c.overrides ?? {}
+  const [start, setStart] = useState(String(o.start_sec ?? c.start_sec))
+  const [end, setEnd] = useState(String(o.end_sec ?? c.end_sec))
+  const [title, setTitle] = useState(o.title ?? '')
+  const [cropMode, setCropMode] = useState<CropMode | ''>(o.crop_mode ?? '')
+  const [cropX, setCropX] = useState(o.crop_x ?? 0.5)
+  const [fontSize, setFontSize] = useState(o.font_size_ratio != null ? String(o.font_size_ratio) : '')
+  const [position, setPosition] = useState(o.caption_position ?? '')
+  const [cues, setCues] = useState<CaptionCue[] | null>(null)
+  const [cuesEdited, setCuesEdited] = useState(!!o.captions)
+  const [err, setErr] = useState('')
+  const [saving, setSaving] = useState(false)
+  const panelRef = useRef<HTMLDivElement>(null)
+
+  // 候補が切り替わったらフォームを詰め直し、字幕の初期値（自動分割 or 手直し済み）を取る
+  useEffect(() => {
+    const ov = c.overrides ?? {}
+    setStart(String(ov.start_sec ?? c.start_sec))
+    setEnd(String(ov.end_sec ?? c.end_sec))
+    setTitle(ov.title ?? '')
+    setCropMode(ov.crop_mode ?? '')
+    setCropX(ov.crop_x ?? 0.5)
+    setFontSize(ov.font_size_ratio != null ? String(ov.font_size_ratio) : '')
+    setPosition(ov.caption_position ?? '')
+    setCuesEdited(!!ov.captions)
+    setErr('')
+    setCues(null)
+    api.candidateCaptions(c.id).then((r) => setCues(r.cues)).catch((e) => setErr(String(e)))
+    panelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }, [c.id, c.overrides, c.start_sec, c.end_sec])
+
+  const s = Number(start)
+  const e = Number(end)
+  const dur = e - s
+  const now = () => videoRef.current?.currentTime ?? 0
+  const seek = (t: number) => {
+    const el = videoRef.current
+    if (el) {
+      el.currentTime = t
+      el.pause()
+    }
+  }
+  const save = async () => {
+    setErr('')
+    if (!Number.isFinite(s) || !Number.isFinite(e)) return setErr('開始・終了は秒数で入力してください')
+    setSaving(true)
+    try {
+      const body = {
+        start_sec: s !== c.start_sec ? s : null,
+        end_sec: e !== c.end_sec ? e : null,
+        title: title.trim() ? title.trim() : null,
+        crop_mode: cropMode || null,
+        crop_x: cropMode === 'manual' ? cropX : null,
+        font_size_ratio: fontSize.trim() ? Number(fontSize) : null,
+        caption_position: position || null,
+        captions: cuesEdited && cues ? cues : null,
+      }
+      const saved = await api.putOverrides(c.id, body)
+      onSaved(saved)
+      notify('手直しを保存しました（学習データとして記録）')
+      // 保存後は親から新しい candidate が渡り、上の effect が区間に合わせて字幕を取り直す
+    } catch (ex) {
+      setErr(String(ex instanceof Error ? ex.message : ex))
+    } finally {
+      setSaving(false)
+    }
+  }
+  const reset = async () => {
+    if (!confirm('この候補の手直しをすべて捨てて AI 案に戻しますか？')) return
+    try {
+      const saved = await api.resetOverrides(c.id)
+      onSaved(saved)
+      notify('AI 案に戻しました')
+    } catch (ex) {
+      setErr(String(ex instanceof Error ? ex.message : ex))
+    }
+  }
+  const updateCue = (i: number, patch: Partial<CaptionCue>) => {
+    if (!cues) return
+    setCuesEdited(true)
+    setCues(cues.map((q, k) => (k === i ? { ...q, ...patch } : q)))
+  }
+  const removeCue = (i: number) => {
+    if (!cues) return
+    setCuesEdited(true)
+    setCues(cues.filter((_, k) => k !== i))
+  }
+  const addCue = () => {
+    const t = Math.min(Math.max(now(), s), e - 0.5)
+    setCuesEdited(true)
+    setCues([...(cues ?? []), { start: Math.round(t * 10) / 10, end: Math.round(Math.min(t + 2, e) * 10) / 10, text: '' }].sort((a, b) => a.start - b.start))
+  }
+  const durBad = !(dur >= 5 && dur <= 90)
+
+  return (
+    <div className="card editpanel" ref={panelRef}>
+      <div className="row">
+        <h3 style={{ fontSize: 13 }}>✏️ #{c.rank} を手直し</h3>
+        {isEdited(c) && <span className="badge accent">編集済み</span>}
+        <span className="grow" />
+        <button className="small ghost" onClick={onClose}>閉じる</button>
+      </div>
+      <div className="muted" style={{ fontSize: 11 }}>直した内容は before/after で記録され、あなたの編集判断として学習に使われます。</div>
+
+      <div className="row">
+        <div className="grow">
+          <label>開始（秒）</label>
+          <input type="number" step="0.1" min={0} max={video.duration_sec} value={start} onChange={(ev) => setStart(ev.target.value)} />
+          <div className="row" style={{ gap: 4, marginTop: 4 }}>
+            <button className="small ghost" onClick={() => setStart(now().toFixed(1))}>⏺ 今の位置を開始に</button>
+            <button className="small ghost" onClick={() => seek(s)}>⏵ 開始へ</button>
+          </div>
+        </div>
+        <div className="grow">
+          <label>終了（秒）</label>
+          <input type="number" step="0.1" min={0} max={video.duration_sec} value={end} onChange={(ev) => setEnd(ev.target.value)} />
+          <div className="row" style={{ gap: 4, marginTop: 4 }}>
+            <button className="small ghost" onClick={() => setEnd(now().toFixed(1))}>⏺ 今の位置を終了に</button>
+            <button className="small ghost" onClick={() => seek(e)}>⏵ 終了へ</button>
+          </div>
+        </div>
+      </div>
+      <div className="row" style={{ fontSize: 12 }}>
+        <span className={durBad ? 'error' : 'muted'}>{fmtTime(s || 0)} → {fmtTime(e || 0)}（{Number.isFinite(dur) ? dur.toFixed(1) : '?'}秒 / 5〜90秒）</span>
+        <span className="grow" />
+        <button className="small" onClick={() => onPreview(s, e)}>▶ この範囲を再生</button>
+      </div>
+
+      <div>
+        <label>タイトル（空なら AI 案「{c.data?.title || c.title}」）</label>
+        <input value={title} onChange={(ev) => setTitle(ev.target.value)} placeholder={c.data?.title || c.title} />
+      </div>
+
+      <div className="row">
+        <div className="grow">
+          <label>構図（9:16）</label>
+          <select value={cropMode} onChange={(ev) => setCropMode(ev.target.value as CropMode | '')}>
+            <option value="">書き出し設定に従う</option>
+            {(Object.keys(CROP_LABEL) as CropMode[]).map((k) => <option key={k} value={k}>{CROP_LABEL[k]}</option>)}
+          </select>
+        </div>
+        <div className="grow">
+          <label>字幕の位置</label>
+          <select value={position} onChange={(ev) => setPosition(ev.target.value as typeof position)}>
+            <option value="">Creator 設定に従う</option>
+            <option value="top">上</option>
+            <option value="center">中央</option>
+            <option value="bottom">下</option>
+          </select>
+        </div>
+        <div className="grow">
+          <label>字幕サイズ（高さ比 0.015〜0.12）</label>
+          <input type="number" step="0.005" min={0.015} max={0.12} value={fontSize} onChange={(ev) => setFontSize(ev.target.value)} placeholder="Creator 設定" />
+        </div>
+      </div>
+      {cropMode === 'manual' && (
+        <div>
+          <label>左右の位置: {cropX < 0.45 ? `左寄り ${Math.round(cropX * 100)}%` : cropX > 0.55 ? `右寄り ${Math.round(cropX * 100)}%` : '中央'}</label>
+          <input type="range" min={0} max={1} step={0.01} value={cropX} onChange={(ev) => setCropX(Number(ev.target.value))} />
+          <div className="row muted" style={{ justifyContent: 'space-between', fontSize: 11 }}><span>左端</span><span>中央</span><span>右端</span></div>
+          <div className="cropguide" style={{ aspectRatio: `${video.width || 16}/${video.height || 9}` }}>
+            <div style={{ left: `${cropX * (1 - (9 / 16) * ((video.height || 9) / (video.width || 16))) * 100}%`, width: `${(9 / 16) * ((video.height || 9) / (video.width || 16)) * 100}%` }} />
+          </div>
+        </div>
+      )}
+
+      <div>
+        <div className="row" style={{ marginBottom: 4 }}>
+          <label style={{ margin: 0 }}>字幕本文（{cuesEdited ? '手直し中' : '自動分割'}）</label>
+          <span className="grow" />
+          <button className="small ghost" onClick={addCue} disabled={!cues}>＋ 追加</button>
+          {cuesEdited && (
+            <button className="small ghost" onClick={async () => { setCuesEdited(false); await api.putOverrides(c.id, { captions: null }).then(onSaved).catch(() => {}); const r = await api.candidateCaptions(c.id); setCues(r.cues) }}>自動分割に戻す</button>
+          )}
+        </div>
+        {!cues ? (
+          <div className="muted" style={{ fontSize: 12 }}>読み込み中…</div>
+        ) : cues.length === 0 ? (
+          <div className="muted" style={{ fontSize: 12 }}>この区間に字幕はありません。</div>
+        ) : (
+          <div className="cues">
+            {cues.map((q, i) => (
+              <div key={i} className="cue">
+                <div className="row" style={{ gap: 4 }}>
+                  <input type="number" step="0.1" value={q.start} onChange={(ev) => updateCue(i, { start: Number(ev.target.value) })} />
+                  <span className="muted">→</span>
+                  <input type="number" step="0.1" value={q.end} onChange={(ev) => updateCue(i, { end: Number(ev.target.value) })} />
+                  <button className="small ghost" title="ここへシーク" onClick={() => seek(q.start)}>⏵</button>
+                  <button className="small ghost" title="この字幕を消す" onClick={() => removeCue(i)}>×</button>
+                </div>
+                <textarea rows={2} value={q.text} onChange={(ev) => updateCue(i, { text: ev.target.value })} placeholder="（空なら表示しない）" />
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>方言・口癖はそのままに。改行はそのまま 2 行目になります。</div>
+      </div>
+
+      {err && <div className="error">{err}</div>}
+      <div className="row" style={{ justifyContent: 'flex-end' }}>
+        <button className="ghost small" onClick={reset} disabled={!isEdited(c)}>AI 案に戻す</button>
+        <button className="primary" onClick={save} disabled={saving || durBad}>{saving ? '保存中…' : '保存'}</button>
+      </div>
+    </div>
+  )
 }
 
 // ──────────────────────────── コスト ────────────────────────────
@@ -273,7 +501,16 @@ export default function App() {
   const [captions, setCaptions] = useState(true)
   const [preview, setPreview] = useState<{ start: number; end: number } | null>(null)
   const [err, setErr] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [toast, setToast] = useState('')
   const videoRef = useRef<HTMLVideoElement>(null)
+  const srtInputRef = useRef<HTMLInputElement>(null)
+  const notify = useCallback((msg: string) => setToast(msg), [])
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(''), 4000)
+    return () => clearTimeout(t)
+  }, [toast])
 
   const creator = creators.find((c) => c.id === creatorId) ?? null
   const video = videos.find((v) => v.id === videoId) ?? null
@@ -311,6 +548,7 @@ export default function App() {
     if (videoId) {
       setSelected(new Set())
       setPreview(null)
+      setEditingId(null)
       setAnalyzeJobId(null)
       setExportJobId(null)
       loadVideoDetail(videoId)
@@ -394,6 +632,27 @@ export default function App() {
       setSelected(s)
     }
   }
+
+  const onCandidateSaved = (saved: Candidate) => setCands(cands.map((x) => (x.id === saved.id ? saved : x)))
+  // 別 editor が実装中の契約。無いサーバでは 404 → トーストで案内（画面は壊さない）
+  const importSrt = async (file: File) => {
+    if (!videoId) return
+    try {
+      await api.importSrt(videoId, file)
+      notify('SRT を読み込みました。候補を出し直すには再解析してください')
+      loadVideoDetail(videoId)
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 404 || e.status === 405)) notify('SRT 読み込みはこのサーバではまだ使えません')
+      else notify('SRT 読み込みに失敗: ' + String(e instanceof Error ? e.message : e))
+    }
+  }
+  const downloadBundle = async () => {
+    if (!videoId) return
+    const ok = await api.bundleAvailable(videoId).catch(() => false)
+    if (!ok) return notify('まとめて ZIP ダウンロードはこのサーバではまだ使えません')
+    window.location.href = api.bundleUrl(videoId)
+  }
+  const editing = cands.find((c) => c.id === editingId) ?? null
 
   const stepOf = () => {
     if (!video) return 0
@@ -479,6 +738,8 @@ export default function App() {
                     <button className="primary" disabled={!!busy} onClick={startAnalyze}>
                       {video.status === 'analyzed' ? '🔁 再解析' : '🔍 解析してShorts候補を出す'}
                     </button>
+                    <input ref={srtInputRef} type="file" accept=".srt,text/plain" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) importSrt(f); e.target.value = '' }} />
+                    <button className="ghost small" disabled={!!busy} title="手持ちの SRT 字幕を文字起こしとして使う" onClick={() => srtInputRef.current?.click()}>📄 SRT を読み込む</button>
                     <button className="ghost small" disabled={!!busy} onClick={async () => { if (confirm('この動画と候補・完成品を削除しますか？')) { await api.deleteVideo(video.id); setVideoId(null); loadVideos(creator.id) } }}>削除</button>
                   </div>
 
@@ -501,7 +762,16 @@ export default function App() {
                       </div>
                       <div className="cand-grid">
                         {cands.map((c) => (
-                          <CandidateCard key={c.id} c={c} selected={selected.has(c.id)} onToggle={() => toggle(c.id)} onPreview={() => setPreview({ start: c.start_sec, end: c.end_sec })} onDecide={(d) => decide(c, d)} />
+                          <CandidateCard
+                            key={c.id}
+                            c={c}
+                            selected={selected.has(c.id)}
+                            editing={editingId === c.id}
+                            onToggle={() => toggle(c.id)}
+                            onPreview={() => { const e = effective(c); setPreview({ start: e.start, end: e.end }) }}
+                            onDecide={(d) => decide(c, d)}
+                            onEdit={() => setEditingId(editingId === c.id ? null : c.id)}
+                          />
                         ))}
                       </div>
                       <div className="exportbar">
@@ -530,7 +800,11 @@ export default function App() {
 
                   {exportsList.length > 0 && (
                     <div className="card">
-                      <h2 style={{ fontSize: 16, marginBottom: 10 }}>完成した Shorts</h2>
+                      <div className="row" style={{ marginBottom: 10 }}>
+                        <h2 style={{ fontSize: 16 }}>完成した Shorts</h2>
+                        <span className="grow" />
+                        {exportsList.some((e) => e.status === 'done') && <button className="small" onClick={downloadBundle}>🗜 まとめて ZIP ダウンロード</button>}
+                      </div>
                       <div className="exports">
                         {exportsList.map((e) => (
                           <div key={e.id} className="export-item">
@@ -559,6 +833,17 @@ export default function App() {
                     <video ref={videoRef} src={`/api/videos/${video.id}/file`} controls preload="metadata" />
                     {preview && <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>{fmtTime(preview.start)} → {fmtTime(preview.end)} を再生中（終点で自動停止）</div>}
                   </div>
+                  {editing && (
+                    <EditPanel
+                      c={editing}
+                      video={video}
+                      videoRef={videoRef}
+                      onSaved={onCandidateSaved}
+                      onClose={() => setEditingId(null)}
+                      onPreview={(s, e) => setPreview({ start: s, end: e })}
+                      notify={notify}
+                    />
+                  )}
                   <CostPanel cost={cost} title="この動画の原価" />
                 </div>
               </div>
@@ -567,6 +852,7 @@ export default function App() {
         )}
       </main>
 
+      {toast && <div className="toast" role="status">{toast}</div>}
       {modal && (
         <CreatorModal
           creator={modal === 'edit' ? creator : null}

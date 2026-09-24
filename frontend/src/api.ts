@@ -54,6 +54,19 @@ export type CandidateData = {
   score: number
   tags: string[]
 }
+export type CaptionCue = { start: number; end: number; text: string } // 元動画の絶対秒
+export type CropMode = 'face_track' | 'center' | 'blur_fit' | 'manual'
+/** 人の手直し。無いキーは AI 案のまま。保存は PUT で部分更新（null でキー削除）。 */
+export type Overrides = {
+  start_sec?: number
+  end_sec?: number
+  title?: string
+  crop_mode?: CropMode
+  crop_x?: number // manual 時の左右位置 0〜1
+  font_size_ratio?: number
+  caption_position?: 'top' | 'center' | 'bottom'
+  captions?: CaptionCue[]
+}
 export type Candidate = {
   id: string
   rank: number
@@ -63,7 +76,14 @@ export type Candidate = {
   title: string
   decision: 'pending' | 'accepted' | 'rejected'
   data: CandidateData
+  overrides: Overrides
 }
+/** overrides を反映した表示用の開始/終了/タイトル。 */
+export const effective = (c: Candidate) => {
+  const o = c.overrides ?? {}
+  return { start: o.start_sec ?? c.start_sec, end: o.end_sec ?? c.end_sec, title: o.title || c.data?.title || c.title }
+}
+export const isEdited = (c: Candidate) => Object.keys(c.overrides ?? {}).length > 0
 
 export type Export = {
   id: string
@@ -89,16 +109,24 @@ export type Status = {
   }
 }
 
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, msg: string) {
+    super(msg)
+    this.status = status
+  }
+}
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let msg = `${res.status}`
     try {
       const b = await res.json()
-      msg = b.detail ?? JSON.stringify(b)
+      msg = typeof b.detail === 'string' ? b.detail : JSON.stringify(b.detail ?? b)
     } catch {
       /* noop */
     }
-    throw new Error(msg)
+    throw new ApiError(res.status, msg)
   }
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
@@ -118,6 +146,20 @@ export const api = {
   candidates: (id: string) => fetch(`/api/videos/${id}/candidates`).then((r) => j<Candidate[]>(r)),
   decide: (cid: string, decision: Candidate['decision']) =>
     fetch(`/api/candidates/${cid}/decision`, { method: 'POST', headers: H, body: JSON.stringify({ decision }) }).then((r) => j<unknown>(r)),
+  // 候補の手直し（Phase5 の学習データ。サーバ側で HumanEdit に before/after が残る）
+  putOverrides: (cid: string, body: Partial<Record<keyof Overrides, unknown>>) =>
+    fetch(`/api/candidates/${cid}/overrides`, { method: 'PUT', headers: H, body: JSON.stringify(body) }).then((r) => j<Candidate>(r)),
+  resetOverrides: (cid: string) => fetch(`/api/candidates/${cid}/reset`, { method: 'POST' }).then((r) => j<Candidate>(r)),
+  candidateCaptions: (cid: string) =>
+    fetch(`/api/candidates/${cid}/captions`).then((r) => j<{ source: 'auto' | 'override'; start_sec: number; end_sec: number; cues: CaptionCue[] }>(r)),
+  // 以下 2 つはサーバ側が別途実装中の契約。404 のときは呼び出し側でトースト表示する
+  importSrt: (videoId: string, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch(`/api/videos/${videoId}/transcript/srt`, { method: 'POST', body: fd }).then((r) => j<unknown>(r))
+  },
+  bundleUrl: (videoId: string) => `/api/videos/${videoId}/bundle.zip`,
+  bundleAvailable: (videoId: string) => fetch(`/api/videos/${videoId}/bundle.zip`, { method: 'HEAD' }).then((r) => r.status !== 404 && r.status !== 405),
   createExports: (videoId: string, candidate_ids: string[], options: Record<string, unknown>) =>
     fetch(`/api/videos/${videoId}/exports`, { method: 'POST', headers: H, body: JSON.stringify({ candidate_ids, options }) }).then((r) => j<{ job: Job; exports: Export[] }>(r)),
   exports: (videoId: string) => fetch(`/api/videos/${videoId}/exports`).then((r) => j<Export[]>(r)),

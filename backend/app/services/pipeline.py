@@ -16,7 +16,7 @@ from ..schemas.transcript import TranscriptData
 from . import cost
 from .candidates import select_candidates
 from .jobs import JobContext
-from .render import render_candidate
+from .render import effective_range, render_candidate
 
 log = logging.getLogger(__name__)
 
@@ -33,8 +33,24 @@ def _creator_vocab(creator: Creator) -> list[str]:
     return out
 
 
-def run_analyze(job_id: str, video_id: str, n_candidates: int = 10) -> Any:
+def run_analyze(job_id: str, video_id: str, n_candidates: int = 10, reuse_transcript: bool = False) -> Any:
+    """reuse_transcript=True: 保存済み Transcript（SRT 読込・前回の文字起こし）があれば文字起こしを飛ばして
+    候補選定だけやり直す。文字起こしの原価も記録しない。無ければ通常どおり文字起こしする。"""
+
     def _fn(ctx: JobContext) -> dict[str, Any]:
+        try:
+            return _analyze(ctx)
+        except Exception as e:  # noqa: BLE001
+            with session_scope() as s:
+                video = s.get(Video, video_id)
+                if video:
+                    video.status = "failed"
+                    video.error = str(e)[-500:]
+                    s.add(video)
+                    s.commit()
+            raise
+
+    def _analyze(ctx: JobContext) -> dict[str, Any]:
         s_cfg = get_settings()
         vp = get_video_provider()
         with session_scope() as s:
@@ -50,25 +66,33 @@ def run_analyze(job_id: str, video_id: str, n_candidates: int = 10) -> Any:
             vtitle = video.title
             cid = creator.id
             vocab = _creator_vocab(creator)
+            existing = s.exec(select(Transcript).where(Transcript.video_id == video_id)).first() if reuse_transcript else None
+            transcript = TranscriptData(**existing.data) if existing else None
+            existing_provider = existing.provider if existing else ""
 
-        # 1) 音声抽出
-        ctx.update("音声を抽出", 0.02, "16kHz mono に変換中")
         work = s_cfg.work_dir / video_id
         work.mkdir(parents=True, exist_ok=True)
-        audio = vp.extract_audio(vpath, work / "audio.mp3")
+        if transcript is not None:
+            # 0) 保存済みを再利用（SRT 読込・再解析）。音声抽出も文字起こしも原価記録も飛ばす
+            ctx.update("文字起こしを再利用", 0.55, f"provider={existing_provider} segments={len(transcript.segments)}")
+        else:
+            # 1) 音声抽出
+            ctx.update("音声を抽出", 0.02, "16kHz mono に変換中")
+            audio = vp.extract_audio(vpath, work / "audio.mp3")
 
-        # 2) 文字起こし
-        stt = get_transcription_provider()
-        ctx.update("文字起こし", 0.1, f"provider={stt.name}")
-        tr = stt.transcribe(audio, language="ja", vocabulary=vocab,
-                            progress=lambda m, p: ctx.update("文字起こし", 0.1 + 0.45 * p, m))
-        with session_scope() as s:
-            for old in s.exec(select(Transcript).where(Transcript.video_id == video_id)).all():
-                s.delete(old)
-            s.add(Transcript(video_id=video_id, creator_id=cid, provider=stt.name, model=getattr(stt, "model", ""),
-                             language=tr.transcript.language, data=tr.transcript.model_dump()))
-            s.commit()
-            cost.record_usage(s, category="transcription", usage=tr.usage, creator_id=cid, video_id=video_id, job_id=job_id)
+            # 2) 文字起こし
+            stt = get_transcription_provider()
+            ctx.update("文字起こし", 0.1, f"provider={stt.name}")
+            tr = stt.transcribe(audio, language="ja", vocabulary=vocab,
+                                progress=lambda m, p: ctx.update("文字起こし", 0.1 + 0.45 * p, m))
+            transcript = tr.transcript
+            with session_scope() as s:
+                for old in s.exec(select(Transcript).where(Transcript.video_id == video_id)).all():
+                    s.delete(old)
+                s.add(Transcript(video_id=video_id, creator_id=cid, provider=stt.name, model=getattr(stt, "model", ""),
+                                 language=transcript.language, data=transcript.model_dump()))
+                s.commit()
+                cost.record_usage(s, category="transcription", usage=tr.usage, creator_id=cid, video_id=video_id, job_id=job_id)
 
         if ctx.cancelled():
             raise RuntimeError("cancelled")
@@ -79,10 +103,16 @@ def run_analyze(job_id: str, video_id: str, n_candidates: int = 10) -> Any:
         with session_scope() as s:
             creator = s.get(Creator, cid)
             assert creator
-            res = select_candidates(llm, creator, tr.transcript, vtitle, n=n_candidates)
+            res = select_candidates(llm, creator, transcript, vtitle, n=n_candidates)
             cost.record_usage(s, category="llm", usage=res.usage, creator_id=cid, video_id=video_id, job_id=job_id)
+            # 旧候補: 書き出し済み（Export が参照）のものは消さず superseded にして残す（外部キー保護 + 完成品の履歴維持）
             for old in s.exec(select(Candidate).where(Candidate.video_id == video_id)).all():
-                s.delete(old)
+                if s.exec(select(Export.id).where(Export.candidate_id == old.id)).first():
+                    old.rank = 0
+                    old.data = {**(old.data or {}), "superseded": True}
+                    s.add(old)
+                else:
+                    s.delete(old)
             s.commit()
             cl = res.parsed
             rows = []
@@ -146,7 +176,8 @@ def run_export(job_id: str, export_ids: list[str], options: dict[str, Any]) -> A
                 transcript = TranscriptData(**trow.data)
                 out_dir = s_cfg.exports_dir / creator.id / video.id
                 out_dir.mkdir(parents=True, exist_ok=True)
-                safe_title = "".join(ch for ch in cand.title if ch.isalnum() or ch in "ー_-　 ")[:24].strip() or "short"
+                _, _, eff_title = effective_range(cand)  # 人が直したタイトルを優先
+                safe_title = "".join(ch for ch in eff_title if ch.isalnum() or ch in "ー_-　 ")[:24].strip() or "short"
                 out_path = out_dir / f"{cand.rank:02d}_{safe_title}_{cand.id}.mp4"
                 # ORM オブジェクトをセッション外で使うため必要値を取り出す
                 v_copy, c_copy, cand_copy = Video(**video.model_dump()), Creator(**creator.model_dump()), Candidate(**cand.model_dump())

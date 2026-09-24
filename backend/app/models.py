@@ -9,7 +9,8 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Column, Text
+from sqlalchemy import JSON, Column, Text, event
+from sqlalchemy.engine import Engine
 from sqlmodel import Field, SQLModel
 
 
@@ -80,6 +81,10 @@ class Candidate(SQLModel, table=True):
     # 人間の判断（Phase5 の学習材料）: pending | accepted | rejected
     decision: str = "pending"
     decided_at: Optional[datetime] = None
+    # 人間の手直し（GUI）。元の start/end/title/data は残し、書き出し時にこれを上乗せする。
+    # {start_sec, end_sec, title, crop_mode, crop_x, font_size_ratio, caption_position, captions:[{start,end,text}]}
+    # 変更は必ず HumanEdit(candidate_edited) に before/after で残す（Phase5 の学習材料）。
+    overrides: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -152,3 +157,43 @@ class HumanEdit(SQLModel, table=True):
     # LLM が推定した「なぜ直したか」（Phase5）
     inferred_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=_now)
+
+
+# ────────────────────────── 軽量マイグレーション ──────────────────────────
+# SQLModel.metadata.create_all は既存テーブルに列を足さない。列追加は「無ければ ALTER」で追従する。
+# (table, column, DDL)
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("candidate", "overrides", "JSON DEFAULT '{}'"),
+)
+
+
+def _migrate_dbapi(conn) -> list[str]:  # noqa: ANN001
+    """生の sqlite3 接続に対して不足列を足す。戻り値: 足した "table.column"。"""
+    added: list[str] = []
+    for table, col, ddl in _ADDED_COLUMNS:
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if cols and col not in cols:  # テーブル未作成なら create_all に任せる
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+            added.append(f"{table}.{col}")
+    if added:
+        conn.commit()
+    return added
+
+
+@event.listens_for(Engine, "connect")
+def _migrate_on_connect(dbapi_conn, _record) -> None:  # noqa: ANN001
+    """どの Engine でも接続時に列を補う（旧 DB でも SELECT candidate.overrides が落ちないように）。"""
+    try:
+        _migrate_dbapi(dbapi_conn)
+    except Exception:  # noqa: BLE001  — 読み取り専用 DB 等。以降の SELECT で本当のエラーが出る
+        pass
+
+
+def ensure_candidate_overrides_column(engine=None) -> list[str]:  # noqa: ANN001
+    """Candidate.overrides 列を明示的に保証する（接続時フックの手動版。冪等）。"""
+    if engine is None:
+        from .db import get_engine
+
+        engine = get_engine()
+    with engine.begin() as conn:
+        return _migrate_dbapi(conn.connection.dbapi_connection)

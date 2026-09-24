@@ -20,14 +20,59 @@ class AssCaptionProvider(CaptionProvider):
     name = "ass"
 
     def build_ass(self, words: list[Word], *, clip_start: float, clip_end: float, style: CaptionStyle | dict[str, Any], out_w: int, out_h: int) -> str:
-        st = style if isinstance(style, CaptionStyle) else CaptionStyle(**{k: v for k, v in (style or {}).items() if k in CaptionStyle.model_fields})
+        st = _style(style)
         cues = _chunk_words(words, st, clip_start, clip_end)
-        font_size = int(out_h * st.font_size_ratio)
-        margin_v = int(out_h * st.margin_v_ratio)
-        align = {"bottom": 2, "center": 5, "top": 8, "custom": 2}[st.position]
-        bold = -1 if st.font_weight != "regular" else 0
-        border = 3 if st.background_box else 1
-        header = f"""[Script Info]
+        return _render_ass(cues, st, out_w, out_h)
+
+    def split_cues(self, words: list[Word], *, clip_start: float, clip_end: float, style: CaptionStyle | dict[str, Any]) -> list[dict[str, Any]]:
+        """単語列 → 表示単位を **元動画の絶対秒** で返す（GUI の字幕手直しの初期値）。改行は実改行。"""
+        st = _style(style)
+        return [{"start": round(s + clip_start, 3), "end": round(e + clip_start, 3), "text": text.replace(r"\N", "\n")}
+                for s, e, text in _chunk_words(words, st, clip_start, clip_end)]
+
+    def build_ass_from_cues(self, cues: list[dict[str, Any]], *, clip_start: float, clip_end: float, style: CaptionStyle | dict[str, Any],
+                            out_w: int, out_h: int) -> str:
+        """人が手直しした cue 列（絶対秒の {start,end,text}）から ASS を作る。
+
+        本文は分割し直さない（人の判断をそのまま焼く）。改行を含まない長文だけ max_chars_per_line で折る。
+        """
+        st = _style(style)
+        return _render_ass(cues_relative(cues, st, clip_start, clip_end), st, out_w, out_h)
+
+
+def _style(style: CaptionStyle | dict[str, Any]) -> CaptionStyle:
+    return style if isinstance(style, CaptionStyle) else CaptionStyle(**{k: v for k, v in (style or {}).items() if k in CaptionStyle.model_fields})
+
+
+def cues_relative(cues: list[dict[str, Any]], st: CaptionStyle, clip_start: float, clip_end: float) -> list[tuple[float, float, str]]:
+    """絶対秒の cue 列 → クリップ相対（区間外は切り落とし、空文は落とす、重なりは前を詰める）。"""
+    out: list[tuple[float, float, str]] = []
+    for c in sorted(cues or [], key=lambda c: float(c.get("start", 0.0))):
+        text = str(c.get("text", "")).replace("\r", "").strip()
+        if not text:
+            continue
+        s = max(float(c.get("start", 0.0)), clip_start) - clip_start
+        e = min(float(c.get("end", 0.0)), clip_end) - clip_start
+        if e <= s:
+            continue
+        text = text.replace("\n", r"\N") if "\n" in text else _wrap(text, st.max_chars_per_line)
+        out.append((s, e, text))
+    for i in range(1, len(out)):
+        ps, pe, pt = out[i - 1]
+        s, _e, _t = out[i]
+        if pe > s:
+            out[i - 1] = (ps, s, pt)
+    return out
+
+
+def _render_ass(cues: list[tuple[float, float, str]], st: CaptionStyle, out_w: int, out_h: int) -> str:
+    """クリップ相対 cue 列 → ASS 文字列（ヘッダ + Dialogue 行）。"""
+    font_size = int(out_h * st.font_size_ratio)
+    margin_v = int(out_h * st.margin_v_ratio)
+    align = {"bottom": 2, "center": 5, "top": 8, "custom": 2}[st.position]
+    bold = -1 if st.font_weight != "regular" else 0
+    border = 3 if st.background_box else 1
+    header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {out_w}
 PlayResY: {out_h}
@@ -42,17 +87,17 @@ Style: Emph,{st.font},{int(font_size * st.emphasis_scale)},{_ass_color(st.emphas
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-        lines = []
-        for s, e, text in cues:
-            fx = ""
-            if st.animation == "pop":
-                fx = r"{\fscx80\fscy80\t(0,80,\fscx100\fscy100)}"
-            elif st.animation == "fade":
-                fx = r"{\fad(80,80)}"
-            elif st.animation == "typewriter":
-                text = _typewriter(text, e - s)
-            lines.append(f"Dialogue: 0,{_ts(s)},{_ts(e)},Default,,0,0,0,,{fx}{text}")
-        return header + "\n".join(lines) + "\n"
+    lines = []
+    for s, e, text in cues:
+        fx = ""
+        if st.animation == "pop":
+            fx = r"{\fscx80\fscy80\t(0,80,\fscx100\fscy100)}"
+        elif st.animation == "fade":
+            fx = r"{\fad(80,80)}"
+        elif st.animation == "typewriter":
+            text = _typewriter(text, e - s)
+        lines.append(f"Dialogue: 0,{_ts(s)},{_ts(e)},Default,,0,0,0,,{fx}{text}")
+    return header + "\n".join(lines) + "\n"
 
 
 def _typewriter(text: str, duration: float) -> str:

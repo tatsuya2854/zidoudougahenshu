@@ -10,7 +10,7 @@ from .base import CaptionProvider, LLMProvider, TranscriptionProvider, VideoProc
 @lru_cache
 def get_transcription_provider() -> TranscriptionProvider:
     s = get_settings()
-    name = s.effective_transcription_provider()
+    name, _reason = s.resolve_transcription_provider()
     if name == "openai":
         from .transcription.openai_stt import OpenAITranscription
 
@@ -18,6 +18,7 @@ def get_transcription_provider() -> TranscriptionProvider:
     if name == "faster_whisper":
         from .transcription.faster_whisper_stt import FasterWhisperTranscription
 
+        # モデルのロードは transcribe 時（遅延）。ここでは失敗しない
         return FasterWhisperTranscription(model_size=s.faster_whisper_model, device=s.faster_whisper_device)
     from .transcription.mock_stt import MockTranscription
 
@@ -71,9 +72,11 @@ def get_caption_provider() -> CaptionProvider:
 
 def provider_status() -> dict:
     s = get_settings()
+    stt_name, stt_reason = s.resolve_transcription_provider()
+    stt_model = {"openai": s.transcription_model, "faster_whisper": s.faster_whisper_model}.get(stt_name, "")
     return {
         "llm": {"configured": s.llm_provider, "effective": s.effective_llm_provider(), "model": s.llm_model},
-        "transcription": {"configured": s.transcription_provider, "effective": s.effective_transcription_provider(), "model": s.transcription_model},
+        "transcription": {"configured": s.transcription_provider, "effective": stt_name, "model": stt_model, "reason": stt_reason},
         "vision": {"effective": get_vision_provider().name},
         "video": {"effective": "ffmpeg"},
     }

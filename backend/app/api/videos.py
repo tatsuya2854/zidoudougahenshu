@@ -13,12 +13,18 @@ from ..config import get_settings
 from ..db import get_session
 from ..models import Candidate, Creator, Export, Job, Transcript, Video
 from ..providers.registry import get_video_provider
+from ..providers.transcription.srt_import import PROVIDER_NAME as SRT_PROVIDER, parse_srt
 from ..services import cost
 from ..services.jobs import create_job, submit
 from ..services.pipeline import run_analyze
 
 router = APIRouter(tags=["videos"])
 ALLOWED = {".mp4", ".mov", ".mkv", ".m4v", ".webm", ".avi", ".mts"}
+SRT_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _running_job(s: Session, video_id: str) -> Job | None:
+    return s.exec(select(Job).where(Job.video_id == video_id, Job.status.in_(["queued", "running"]))).first()  # type: ignore[attr-defined]
 
 
 @router.post("/creators/{creator_id}/videos", status_code=201)
@@ -110,16 +116,43 @@ def video_file(video_id: str, s: Session = Depends(get_session)) -> FileResponse
 
 
 @router.post("/videos/{video_id}/analyze", status_code=202)
-def analyze(video_id: str, n: int = 10, s: Session = Depends(get_session)) -> dict:
+def analyze(video_id: str, n: int = 10, reuse_transcript: bool = False, s: Session = Depends(get_session)) -> dict:
+    """reuse_transcript=true: 保存済みの文字起こし（SRT 読込含む）を使い、候補選定だけやり直す。"""
     v = s.get(Video, video_id)
     if not v:
         raise HTTPException(404)
-    running = s.exec(select(Job).where(Job.video_id == video_id, Job.status.in_(["queued", "running"]))).first()  # type: ignore[attr-defined]
-    if running:
+    if _running_job(s, video_id):
         raise HTTPException(409, "この動画のジョブが実行中です")
-    job = create_job("analyze", video_id=video_id, creator_id=v.creator_id, payload={"n": n})
-    submit(job, run_analyze(job.id, video_id, n_candidates=max(10, n)))
+    job = create_job("analyze", video_id=video_id, creator_id=v.creator_id, payload={"n": n, "reuse_transcript": reuse_transcript})
+    submit(job, run_analyze(job.id, video_id, n_candidates=max(10, n), reuse_transcript=reuse_transcript))
     return job.model_dump()
+
+
+@router.post("/videos/{video_id}/transcript/srt")
+async def import_transcript_srt(video_id: str, file: UploadFile = File(...), s: Session = Depends(get_session)) -> dict:
+    """SRT 字幕を文字起こしとして登録（既存の Transcript は置換）。続けて analyze?reuse_transcript=true で候補を出す。"""
+    v = s.get(Video, video_id)
+    if not v:
+        raise HTTPException(404)
+    if _running_job(s, video_id):
+        raise HTTPException(409, "この動画のジョブが実行中です")
+    raw = await file.read(SRT_MAX_BYTES + 1)
+    if len(raw) > SRT_MAX_BYTES:
+        raise HTTPException(400, "SRT は 5MB 以下にしてください")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise HTTPException(400, "UTF-8 の SRT を選んでください（Shift_JIS は未対応）") from e
+    try:
+        data = parse_srt(text, duration=v.duration_sec or None)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    for old in s.exec(select(Transcript).where(Transcript.video_id == video_id)).all():
+        s.delete(old)
+    s.add(Transcript(video_id=video_id, creator_id=v.creator_id, provider=SRT_PROVIDER, model="",
+                     language=data.language, data=data.model_dump()))
+    s.commit()
+    return {"segments": len(data.segments), "duration": data.duration, "provider": SRT_PROVIDER}
 
 
 @router.get("/videos/{video_id}/transcript")
@@ -133,7 +166,8 @@ def transcript(video_id: str, s: Session = Depends(get_session)) -> dict:
 @router.get("/videos/{video_id}/candidates")
 def candidates(video_id: str, s: Session = Depends(get_session)) -> list[dict]:
     rows = s.exec(select(Candidate).where(Candidate.video_id == video_id).order_by(Candidate.rank)).all()
-    return [c.model_dump() for c in rows]
+    # 再解析で置き換えられた旧候補（書き出し済みのため残している）は一覧に出さない
+    return [c.model_dump() for c in rows if not (c.data or {}).get("superseded")]
 
 
 @router.get("/videos/{video_id}/cost")

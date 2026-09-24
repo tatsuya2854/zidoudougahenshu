@@ -1,2 +1,9 @@
-# ローカル文字起こし（任意）。GPU無しでもCPUで動くが遅い。
-faster-whisper>=1.1.0
+# GPU（CUDA）でローカル文字起こしを速くしたい人向けのメモ。
+# faster-whisper 本体は requirements.txt に入っている（CPU / int8 で動く）。
+#
+# NVIDIA GPU で使うには CUDA 12 + cuDNN 9 のランタイムが必要:
+#   pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+# その上で .env に
+#   FASTER_WHISPER_DEVICE=cuda
+# を入れると float16 で動く（large-v3-turbo で 1 時間の動画が数分）。
+# Apple Silicon は CPU 扱い（Metal 非対応）。medium 以下を推奨。

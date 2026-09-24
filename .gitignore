@@ -20,6 +20,9 @@ data/
 *.db
 *.sqlite
 
+# Mac .app（launcher/build_mac_app.sh が生成）
+*.app/
+
 # os
 .DS_Store
 Thumbs.db
